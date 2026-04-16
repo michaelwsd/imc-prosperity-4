@@ -1,200 +1,266 @@
-from datamodel import OrderDepth, UserId, TradingState, Order
+from datamodel import OrderDepth, TradingState, Order
 from typing import List, Dict
 import json
 import math
 
 
 class Trader:
+    """Round 1 trader for ASH_COATED_OSMIUM and INTARIAN_PEPPER_ROOT.
+
+    Empirical findings (from 3 days of round1 data):
+
+      OSMIUM
+        - Fair value stable around 10000 (std ~5)
+        - Modal spread 16; bot flow concentrates at ±8 from mid
+        - Return autocorrelation ≈ -0.5 (tick-by-tick reversion)
+        - Solution: fixed fair + TAKE edges + LAYERED resting quotes
+          to intercept flow inside the bot spread.
+
+      PEPPER
+        - Deterministic linear drift of +0.1 / tick (≈+1000/day)
+        - Noise std ≈ 3/tick around drift, autocorr ≈ -0.5
+        - Bot flow clusters near mid (|dev|avg ~4-5)
+        - Solution: microprice EMA + drift forecast + LONG-BIASED
+          inventory target to capture the drift while market-making.
+
+    Position limit: 80 per product. Products with one-sided books
+    (~8% of ticks) fall back to last-known fair value via traderData.
+    """
+
     POSITION_LIMIT = 80
 
-    # EMERALDS config
-    EMERALDS_FAIR = 10000
-    EMERALDS_MM_EDGE = 4       # resting orders at 9996/10004
+    # ── OSMIUM config ──────────────────────────────────────────────
+    OSM = "ASH_COATED_OSMIUM"
+    OSM_FAIR = 10000
+    OSM_TAKE_EDGE = 1          # take asks <= fair-1, bids >= fair+1
+    OSM_SKEW = 0.04            # shift fair down by skew*position
+    # Four layers — maximise flow capture across widths
+    OSM_LAYERS = [(1, 10), (2, 15), (3, 20), (5, 35)]  # (edge, size) per side
 
-    # TOMATOES config
-    TOMATOES_EMA_SPAN = 12     # balanced EMA responsiveness
-    TOMATOES_MM_EDGE = 5       # wider resting orders to reduce adverse selection
-    TOMATOES_POSITION_SKEW = 0.03  # inventory skew to reduce drawdown
+    # ── PEPPER config ──────────────────────────────────────────────
+    PEP = "INTARIAN_PEPPER_ROOT"
+    PEP_EMA_SPAN = 8           # fast EMA — mid is rising +0.1/tick
+    PEP_DRIFT_PER_TICK = 0.10  # empirically measured, +1000/day
+    PEP_DRIFT_HORIZON = 30     # anticipate 30 ticks of drift into fair
+    PEP_INVENTORY_TARGET = 70  # lean heavily long to harvest drift
+    PEP_SKEW = 0.03            # tiny skew — let inventory ride the drift
+    PEP_BUY_TAKE_EDGE = 0      # take any ask at or below drift-adjusted fair
+    PEP_SELL_TAKE_EDGE = 3     # only sell if bid is 3 above fair (drift will catch up)
+    PEP_LAYERS = [(1, 15), (3, 25), (5, 40)]  # (edge, size) per side
 
     def run(self, state: TradingState):
-        if state.traderData and state.traderData != "":
-            saved = json.loads(state.traderData)
-        else:
-            saved = {"tomatoes_ema": None}
+        saved = {}
+        if state.traderData:
+            try:
+                saved = json.loads(state.traderData)
+            except Exception:
+                saved = {}
+        saved.setdefault("pep_ema", None)
+        saved.setdefault("osm_fair", float(self.OSM_FAIR))
 
         result: Dict[str, List[Order]] = {}
-
         for product in state.order_depths:
-            if product == "EMERALDS":
-                orders = self.trade_emeralds(state, product)
-            elif product == "TOMATOES":
-                orders = self.trade_tomatoes(state, product, saved)
+            if product == self.OSM:
+                result[product] = self.trade_osmium(state, product, saved)
+            elif product == self.PEP:
+                result[product] = self.trade_pepper(state, product, saved)
             else:
-                orders = []
-            result[product] = orders
+                result[product] = []
 
-        traderData = json.dumps(saved)
-        conversions = 0
-        return result, conversions, traderData
+        return result, 0, json.dumps(saved)
 
     # ================================================================
-    #  EMERALDS: Fixed fair value market making
+    #  OSMIUM — layered market making around a stable fair value
     # ================================================================
-    def trade_emeralds(self, state: TradingState, product: str) -> List[Order]:
-        order_depth = state.order_depths[product]
+    def trade_osmium(self, state: TradingState, product: str, saved: dict) -> List[Order]:
+        od = state.order_depths[product]
         position = state.position.get(product, 0)
+        start_pos = position
 
-        fair = self.EMERALDS_FAIR
-        buy_orders: List[Order] = []
-        sell_orders: List[Order] = []
+        # Build fair: base 10000, gently updated if mid persistently drifts.
+        best_bid, best_ask = self._best_bbo(od)
+        if best_bid is not None and best_ask is not None:
+            mid = (best_bid + best_ask) / 2
+            # Slow EMA update — 0.5% weight — so fair barely moves unless
+            # persistent asymmetry is present.
+            saved["osm_fair"] = 0.995 * saved["osm_fair"] + 0.005 * mid
 
-        # ── TAKE: buy anything below fair ──────────────────────────
-        for ask_price in sorted(order_depth.sell_orders.keys()):
-            if ask_price < fair:
-                volume = -order_depth.sell_orders[ask_price]
-                room = self.POSITION_LIMIT - position
-                qty = min(volume, room)
+        fair_mid = saved["osm_fair"]
+        # Inventory skew: pushes quotes away from inventory side
+        fair = fair_mid - position * self.OSM_SKEW
+
+        buys, sells = [], []
+
+        # ── TAKE: any ask strictly better than (fair - edge) ─────────
+        for ask in sorted(od.sell_orders.keys()):
+            if ask <= fair - self.OSM_TAKE_EDGE:
+                vol = -od.sell_orders[ask]
+                qty = min(vol, self.POSITION_LIMIT - position)
                 if qty > 0:
-                    buy_orders.append(Order(product, ask_price, qty))
+                    buys.append(Order(product, ask, qty))
                     position += qty
+            else:
+                break
 
-        # ── TAKE: sell into anything above fair ─────────────────────
-        for bid_price in sorted(order_depth.buy_orders.keys(), reverse=True):
-            if bid_price > fair:
-                volume = order_depth.buy_orders[bid_price]
-                room = self.POSITION_LIMIT + position
-                qty = min(volume, room)
+        for bid in sorted(od.buy_orders.keys(), reverse=True):
+            if bid >= fair + self.OSM_TAKE_EDGE:
+                vol = od.buy_orders[bid]
+                qty = min(vol, self.POSITION_LIMIT + position)
                 if qty > 0:
-                    sell_orders.append(Order(product, bid_price, -qty))
+                    sells.append(Order(product, bid, -qty))
                     position -= qty
+            else:
+                break
 
-        # ── MAKE: place resting orders inside the bot spread ────────
-        buy_price = fair - self.EMERALDS_MM_EDGE       # 9996
-        sell_price = fair + self.EMERALDS_MM_EDGE       # 10004
+        # ── MAKE: multi-layer quoting ───────────────────────────────
+        book_best_bid = best_bid if best_bid is not None else int(fair_mid - 4)
+        book_best_ask = best_ask if best_ask is not None else int(fair_mid + 4)
 
-        buy_room = self.POSITION_LIMIT - position
-        sell_room = self.POSITION_LIMIT + position
+        self._layered_quote(
+            buys, sells, product, fair, self.OSM_LAYERS,
+            book_best_bid, book_best_ask, position,
+        )
 
-        if buy_room > 0:
-            buy_orders.append(Order(product, buy_price, buy_room))
-        if sell_room > 0:
-            sell_orders.append(Order(product, sell_price, -sell_room))
-
-        return self.clamp_orders(buy_orders, sell_orders,
-                                 state.position.get(product, 0))
+        return self.clamp_orders(buys, sells, start_pos)
 
     # ================================================================
-    #  TOMATOES: EMA-based mean reversion with inventory skew
+    #  PEPPER — drift-aware long-biased market making
     # ================================================================
-    def trade_tomatoes(self, state: TradingState, product: str, saved: dict) -> List[Order]:
-        order_depth = state.order_depths[product]
+    def trade_pepper(self, state: TradingState, product: str, saved: dict) -> List[Order]:
+        od = state.order_depths[product]
         position = state.position.get(product, 0)
+        start_pos = position
 
-        if not order_depth.buy_orders or not order_depth.sell_orders:
+        best_bid, best_ask = self._best_bbo(od)
+        if best_bid is None and best_ask is None:
             return []
 
-        # ── Calculate fair value via EMA of microprice ──────────────
-        best_bid = max(order_depth.buy_orders.keys())
-        best_ask = min(order_depth.sell_orders.keys())
-        bid_vol = order_depth.buy_orders[best_bid]
-        ask_vol = -order_depth.sell_orders[best_ask]
-        # Microprice: weighted toward the side with more volume
-        microprice = (best_bid * ask_vol + best_ask * bid_vol) / (bid_vol + ask_vol)
-
-        alpha = 2 / (self.TOMATOES_EMA_SPAN + 1)
-        if saved["tomatoes_ema"] is None:
-            saved["tomatoes_ema"] = microprice
+        # Compute microprice (volume-weighted mid). Fall back when one-sided.
+        if best_bid is not None and best_ask is not None:
+            bv = od.buy_orders[best_bid]
+            av = -od.sell_orders[best_ask]
+            micro = (best_bid * av + best_ask * bv) / max(bv + av, 1)
+        elif best_bid is not None:
+            micro = best_bid + 2  # assume fair ~2 above lonely bid
         else:
-            saved["tomatoes_ema"] = alpha * microprice + (1 - alpha) * saved["tomatoes_ema"]
+            micro = best_ask - 2
 
-        # Skew fair value against inventory to encourage position reduction
-        fair = saved["tomatoes_ema"] - position * self.TOMATOES_POSITION_SKEW
+        # EMA of microprice
+        alpha = 2 / (self.PEP_EMA_SPAN + 1)
+        if saved["pep_ema"] is None:
+            saved["pep_ema"] = micro
+        else:
+            saved["pep_ema"] = alpha * micro + (1 - alpha) * saved["pep_ema"]
 
-        buy_orders: List[Order] = []
-        sell_orders: List[Order] = []
+        # Drift-adjusted fair: forecast N ticks ahead. This is the expected
+        # mid price over the holding horizon; it's our reservation price.
+        fair_mid = saved["pep_ema"] + self.PEP_DRIFT_PER_TICK * self.PEP_DRIFT_HORIZON
 
-        # ── TAKE: buy anything below fair ───────────────────────────
-        for ask_price in sorted(order_depth.sell_orders.keys()):
-            if ask_price < fair:
-                volume = -order_depth.sell_orders[ask_price]
-                room = self.POSITION_LIMIT - position
-                qty = min(volume, room)
+        # Inventory skew relative to LONG target. If we're below target, we
+        # "want" to buy → fair shifts up (more willing to pay).
+        deviation = position - self.PEP_INVENTORY_TARGET
+        fair = fair_mid - deviation * self.PEP_SKEW
+
+        buys, sells = [], []
+
+        # ── TAKE asks: asymmetric — aggressive buying while drift is up ──
+        for ask in sorted(od.sell_orders.keys()):
+            if ask <= fair - self.PEP_BUY_TAKE_EDGE:
+                vol = -od.sell_orders[ask]
+                qty = min(vol, self.POSITION_LIMIT - position)
                 if qty > 0:
-                    buy_orders.append(Order(product, ask_price, qty))
+                    buys.append(Order(product, ask, qty))
                     position += qty
+            else:
+                break
 
-        # ── TAKE: sell above fair ───────────────────────────────────
-        for bid_price in sorted(order_depth.buy_orders.keys(), reverse=True):
-            if bid_price > fair:
-                volume = order_depth.buy_orders[bid_price]
-                room = self.POSITION_LIMIT + position
-                qty = min(volume, room)
+        for bid in sorted(od.buy_orders.keys(), reverse=True):
+            if bid >= fair + self.PEP_SELL_TAKE_EDGE:
+                vol = od.buy_orders[bid]
+                qty = min(vol, self.POSITION_LIMIT + position)
                 if qty > 0:
-                    sell_orders.append(Order(product, bid_price, -qty))
+                    sells.append(Order(product, bid, -qty))
                     position -= qty
+            else:
+                break
 
-        # ── MAKE: resting orders around skewed fair ─────────────────
-        buy_price = math.floor(fair - self.TOMATOES_MM_EDGE)
-        sell_price = math.ceil(fair + self.TOMATOES_MM_EDGE)
+        # ── MAKE: multi-layer around drift-adjusted fair ─────────────
+        book_best_bid = best_bid if best_bid is not None else int(fair_mid - 4)
+        book_best_ask = best_ask if best_ask is not None else int(fair_mid + 4)
 
-        buy_room = self.POSITION_LIMIT - position
-        sell_room = self.POSITION_LIMIT + position
+        self._layered_quote(
+            buys, sells, product, fair, self.PEP_LAYERS,
+            book_best_bid, book_best_ask, position,
+        )
 
-        if buy_room > 0:
-            buy_orders.append(Order(product, buy_price, buy_room))
-        if sell_room > 0:
-            sell_orders.append(Order(product, sell_price, -sell_room))
-
-        return self.clamp_orders(buy_orders, sell_orders,
-                                 state.position.get(product, 0))
+        return self.clamp_orders(buys, sells, start_pos)
 
     # ================================================================
-    #  Clamp orders so buys and sells each independently respect limits
+    #  Helpers
     # ================================================================
+    @staticmethod
+    def _best_bbo(od: OrderDepth):
+        best_bid = max(od.buy_orders.keys()) if od.buy_orders else None
+        best_ask = min(od.sell_orders.keys()) if od.sell_orders else None
+        return best_bid, best_ask
+
+    @staticmethod
+    def _place_layer(dest: list, product: str, price: int, desired: int,
+                     room: int, side: int) -> None:
+        qty = min(desired, max(room, 0))
+        if qty <= 0:
+            return
+        dest.append(Order(product, price, qty * side))
+
+    def _layered_quote(self, buys, sells, product, fair, layers,
+                       book_best_bid, book_best_ask, position):
+        """Post a set of (edge, size) layers on each side, respecting book."""
+        prev_bid = book_best_ask  # seed so first bid stays ≤ best_ask - 1
+        prev_ask = book_best_bid
+        buy_used = 0
+        sell_used = 0
+        for edge, size in layers:
+            bid_px = min(int(math.floor(fair - edge)), prev_bid - 1)
+            ask_px = max(int(math.ceil(fair + edge)), prev_ask + 1)
+            buy_room = self.POSITION_LIMIT - position - buy_used
+            sell_room = self.POSITION_LIMIT + position - sell_used
+            self._place_layer(buys, product, bid_px, size, buy_room, side=+1)
+            self._place_layer(sells, product, ask_px, size, sell_room, side=-1)
+            # Re-measure how much we've committed so far
+            buy_used = sum(o.quantity for o in buys if o.quantity > 0)
+            sell_used = sum(-o.quantity for o in sells if o.quantity < 0)
+            prev_bid = bid_px
+            prev_ask = ask_px
+
     def clamp_orders(self, buy_orders: List[Order], sell_orders: List[Order],
                      current_pos: int) -> List[Order]:
-        """
-        The exchange checks: could ALL buys fill? If so, would position
-        exceed the limit? Same check for sells independently.
+        """Respect the exchange's per-side hypothetical-fill position check.
 
-        We cap total buy qty to (LIMIT - position) and total sell qty
-        to (LIMIT + position). If over, we trim the LAST order (the
-        resting one) since aggressive orders are higher priority.
+        Total buy qty cannot exceed LIMIT - position; total sell qty cannot
+        exceed LIMIT + position. If violated, trim from the last-appended
+        orders (resting ones) since aggressive orders are higher priority.
         """
         max_buy = self.POSITION_LIMIT - current_pos
         max_sell = self.POSITION_LIMIT + current_pos
 
-        # Clamp buys
-        total_buy = sum(o.quantity for o in buy_orders)
-        if total_buy > max_buy:
-            excess = total_buy - max_buy
-            # Trim from last order first (resting order)
-            for i in range(len(buy_orders) - 1, -1, -1):
+        def trim(orders, cap, sign):
+            total = sum(sign * o.quantity for o in orders)
+            if total <= cap:
+                return orders
+            excess = total - cap
+            for i in range(len(orders) - 1, -1, -1):
                 if excess <= 0:
                     break
-                reduce = min(excess, buy_orders[i].quantity)
-                new_qty = buy_orders[i].quantity - reduce
-                if new_qty > 0:
-                    buy_orders[i] = Order(buy_orders[i].symbol, buy_orders[i].price, new_qty)
+                cur = sign * orders[i].quantity
+                red = min(excess, cur)
+                new_qty = (cur - red) * sign
+                if new_qty != 0:
+                    orders[i] = Order(orders[i].symbol, orders[i].price, new_qty)
                 else:
-                    buy_orders[i] = None
-                excess -= reduce
-            buy_orders = [o for o in buy_orders if o is not None]
+                    orders[i] = None
+                excess -= red
+            return [o for o in orders if o is not None]
 
-        # Clamp sells
-        total_sell = sum(-o.quantity for o in sell_orders)
-        if total_sell > max_sell:
-            excess = total_sell - max_sell
-            for i in range(len(sell_orders) - 1, -1, -1):
-                if excess <= 0:
-                    break
-                reduce = min(excess, -sell_orders[i].quantity)
-                new_qty = -sell_orders[i].quantity - reduce
-                if new_qty > 0:
-                    sell_orders[i] = Order(sell_orders[i].symbol, sell_orders[i].price, -new_qty)
-                else:
-                    sell_orders[i] = None
-                excess -= reduce
-            sell_orders = [o for o in sell_orders if o is not None]
-
+        buy_orders = trim(buy_orders, max_buy, +1)
+        sell_orders = trim(sell_orders, max_sell, -1)
         return buy_orders + sell_orders

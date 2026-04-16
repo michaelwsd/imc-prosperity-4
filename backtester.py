@@ -193,6 +193,7 @@ def run_backtest(price_file: str, trade_file: str, pos_limit: int = 80):
 
     positions = {}
     cash = 0
+    cash_per_prod = {}
     total_trades = 0
     traderData = ""
     products = set()
@@ -277,6 +278,7 @@ def run_backtest(price_file: str, trade_file: str, pos_limit: int = 80):
             pnl += resting_pnl
             positions[product] = new_pos
             cash += pnl
+            cash_per_prod[product] = cash_per_prod.get(product, 0) + pnl
             total_trades += len(trades)
             tick_own_trades[product] = trades
 
@@ -307,6 +309,10 @@ def run_backtest(price_file: str, trade_file: str, pos_limit: int = 80):
     print(f"  {'─'*60}")
     print(f"  Total trades: {total_trades}")
     print(f"  Final positions: {dict(positions)}")
+    for p in sorted(products):
+        mtm_p = positions.get(p, 0) * mid_prices.get(p, 0)
+        pnl_p = cash_per_prod.get(p, 0) + mtm_p
+        print(f"    {p:<24} cash={cash_per_prod.get(p, 0):>12,.0f}  mtm={mtm_p:>12,.0f}  pnl={pnl_p:>10,.0f}")
     print(f"  Cash:        {cash:>12,.0f} XIRECS")
     print(f"  Unrealized:  {unrealized:>12,.0f} XIRECS")
     print(f"  Total PnL:   {total_pnl:>12,.0f} XIRECS")
@@ -321,19 +327,19 @@ if __name__ == "__main__":
 ╚══════════════════════════════════════════════════════════════════════╝
     """)
 
-    pnl_day2 = run_backtest(
-        "data/tutorial/prices_round_0_day_-2.csv",
-        "data/tutorial/trades_round_0_day_-2.csv"
-    )
-    pnl_day1 = run_backtest(
-        "data/tutorial/prices_round_0_day_-1.csv",
-        "data/tutorial/trades_round_0_day_-1.csv"
-    )
+    results = {}
+    for day in ["-2", "-1", "0"]:
+        results[day] = run_backtest(
+            f"data/round1/prices_round_1_day_{day}.csv",
+            f"data/round1/trades_round_1_day_{day}.csv",
+        )
 
+    total = sum(results.values())
     print(f"\n{'='*70}")
-    print(f"  COMBINED RESULTS")
+    print(f"  COMBINED ROUND 1 RESULTS")
     print(f"{'='*70}")
-    print(f"  Day -2 PnL: {pnl_day2:>10,.0f} XIRECS")
-    print(f"  Day -1 PnL: {pnl_day1:>10,.0f} XIRECS")
-    print(f"  Total PnL:  {pnl_day2 + pnl_day1:>10,.0f} XIRECS")
+    for day, pnl in results.items():
+        print(f"  Day {day:>3} PnL: {pnl:>12,.0f} XIRECS")
+    print(f"  {'─'*40}")
+    print(f"  Total PnL:  {total:>12,.0f} XIRECS")
     print(f"{'='*70}")
