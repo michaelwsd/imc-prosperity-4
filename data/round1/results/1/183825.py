@@ -45,40 +45,26 @@ class Trader:
     # - skew_coef: inventory skew (fair shifts by skew * position)
     # - layers: [(edge, size), ...] resting orders per side
     # - max_book_half_spread: cap widest quote width regardless of book
-    # Research notes from real-exchange analysis (day 0 actual = 9,022):
-    #   - PEPPER captures 97% of pure drift (7.77/tick vs 8.0 theoretical).
-    #     Little room for further improvement on drift capture.
-    #   - OSMIUM was the bottleneck — only 14% of total profit at 1.27/tick.
-    #   - True OSMIUM fair ≈ 10001 (anchored mid-mode), not 10000 — the
-    #     hardcoded 10000 anchor was fighting EMA's correct discovery.
-    #
-    # Optimized choices (validated via 2-fold CV on days -2, -1, and
-    # held-out test on day 0):
-    #   1. OSMIUM: no anchor, pure EMA fair-value discovery (+ ~6,000 vs anchored)
-    #   2. OSMIUM: dense 12-layer quoting — capture many small fills
-    #      across the full bot spread
-    #   3. PEPPER: dense 10-layer quoting for same reason
-    #   4. Both: aggressive take_edge=0 (mean reversion is strong, lag1 ~ -0.5)
     CONFIG = {
         OSM: {
-            "fair_anchor":        None,    # pure EMA — data-driven fair
-            "anchor_weight":      0.0,
+            "fair_anchor":        10000.0,
+            "anchor_weight":      0.97,    # CV-tuned
             "drift_per_tick":     0.0,
             "drift_horizon":      0,
-            "ema_span":           15,
-            "take_edge":          0,
-            "skew_coef":          0.04,
-            "layers":             [(i, 8) for i in range(1, 13)],  # 12 dense layers
+            "ema_span":           20,
+            "take_edge":          0,       # aggressive take — mean reversion is strong
+            "skew_coef":          0.10,    # strong inventory control
+            "layers":             [(2, 15), (4, 20), (6, 30), (7, 15)],
         },
         PEP: {
             "fair_anchor":        None,
             "anchor_weight":      0.0,
             "drift_per_tick":     0.10,
-            "drift_horizon":      70,
+            "drift_horizon":      70,      # CV-tuned; aggressive drift forecast
             "ema_span":           8,
             "take_edge":          0,
-            "skew_coef":          0.04,
-            "layers":             [(i, 10) for i in range(1, 11)],  # 10 dense layers
+            "skew_coef":          0.04,    # CV-tuned equilibrium ~80 long
+            "layers":             [(1, 15), (2, 20), (3, 25), (5, 20)],
         },
     }
 
