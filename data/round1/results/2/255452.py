@@ -68,12 +68,7 @@ class Trader:
             "ema_span":           15,
             "take_edge":          0,
             "skew_coef":          0.04,
-            # Taper-in layer sizes: minimize exposure near fair (where
-            # adverse selection hurts most) and size up at outer edges
-            # (where per-fill profit is larger). Backtester r2 analysis
-            # showed per-fill profit drives real-exchange P&L more than
-            # fill count.
-            "layers":             [(i, max(4, i)) for i in range(1, 13)],
+            "layers":             [(i, 8) for i in range(1, 13)],  # 12 dense layers
         },
         PEP: {
             "fair_anchor":        None,
@@ -83,8 +78,7 @@ class Trader:
             "ema_span":           8,
             "take_edge":          0,
             "skew_coef":          0.04,
-            # Same taper principle: sizes grow with edge
-            "layers":             [(i, max(5, i+3)) for i in range(1, 11)],
+            "layers":             [(i, 10) for i in range(1, 11)],  # 10 dense layers
         },
     }
 
@@ -162,33 +156,42 @@ class Trader:
         return self._clamp(buys, sells, start_pos)
 
     # ================================================================
-    # Fair value: microprice EMA + drift forecast
-    # (Reverted from hybrid wall_mid — real exchange showed hybrid
-    # converges too close to pure mid, giving smaller per-fill spread.)
+    # Fair value: hybrid (microprice + wall_mid) EMA + drift forecast
+    #
+    # Wall mid idea from Frankfurt Hedgehogs (Prosperity 3, 2nd place):
+    # averaging the deepest visible bid and ask gives a more stable
+    # estimate than L1 microprice alone. L1 is noisy from bot
+    # overbidding; deep levels reflect real market-maker quotes.
+    # We average 50/50 for the best of both: stability + responsiveness.
     # ================================================================
     def _compute_fair(self, od: OrderDepth, product: str, cfg: dict,
                       saved: dict) -> Optional[float]:
-        best_bid, best_ask = self._best_bbo(od)
+        bids = list(od.buy_orders.keys())
+        asks = list(od.sell_orders.keys())
 
-        if best_bid is not None and best_ask is not None:
+        if bids and asks:
+            best_bid, best_ask = max(bids), min(asks)
             bv = od.buy_orders[best_bid]
             av = -od.sell_orders[best_ask]
             micro = (best_bid * av + best_ask * bv) / max(bv + av, 1)
-        elif best_bid is not None:
-            micro = best_bid + 2.0
-        elif best_ask is not None:
-            micro = best_ask - 2.0
+            wall_mid = (min(bids) + max(asks)) / 2
+            price_input = 0.5 * micro + 0.5 * wall_mid
+        elif bids:
+            price_input = max(bids) + 2.0
+        elif asks:
+            price_input = min(asks) - 2.0
         else:
             return saved["last_fair"].get(product)
 
+        # Update EMA
         ema_key = product
         span = cfg["ema_span"]
         alpha = 2.0 / (span + 1)
         prev_ema = saved["ema"].get(ema_key)
         if prev_ema is None:
-            ema = micro
+            ema = price_input
         else:
-            ema = alpha * micro + (1 - alpha) * prev_ema
+            ema = alpha * price_input + (1 - alpha) * prev_ema
         saved["ema"][ema_key] = ema
 
         if cfg["fair_anchor"] is not None:
@@ -202,14 +205,25 @@ class Trader:
         return fair
 
     # ================================================================
-    # Layered quoting (symmetric sizing — reverted asymmetric).
-    # Real exchange showed asymmetric scaling cut OSMIUM fills by ~20%.
-    # Fewer quotes = fewer fills, regardless of directional bias.
+    # Layered quoting with position-aware asymmetric sizing
+    #
+    # When long, we shrink bid-side sizes (to slow further accumulation)
+    # and keep ask-side full (to unwind fast). Mirror for short.
+    # Values tuned via CV: strength 0.8, floor 0.2.
     # ================================================================
+    ASYM_STRENGTH = 0.8   # how strongly position skews layer sizes
+    ASYM_FLOOR = 0.2      # minimum scale factor — never fully zero a side
+
     def _place_layers(self, buys: list, sells: list, product: str,
                       fair: float, layers: list,
                       best_bid: Optional[int], best_ask: Optional[int],
                       position: int) -> None:
+        pos_ratio = position / self.POSITION_LIMIT  # -1 to 1
+        buy_scale = max(self.ASYM_FLOOR,
+                        1 - max(pos_ratio, 0) * self.ASYM_STRENGTH)
+        sell_scale = max(self.ASYM_FLOOR,
+                         1 + min(pos_ratio, 0) * self.ASYM_STRENGTH)
+
         prev_bid_px = best_ask if best_ask is not None else int(fair + 4)
         prev_ask_px = best_bid if best_bid is not None else int(fair - 4)
 
@@ -222,8 +236,8 @@ class Trader:
             buy_room = self.POSITION_LIMIT - position - buy_used
             sell_room = self.POSITION_LIMIT + position - sell_used
 
-            buy_qty = min(size, max(buy_room, 0))
-            sell_qty = min(size, max(sell_room, 0))
+            buy_qty = min(int(size * buy_scale), max(buy_room, 0))
+            sell_qty = min(int(size * sell_scale), max(sell_room, 0))
 
             if buy_qty > 0:
                 buys.append(Order(product, bid_px, buy_qty))
