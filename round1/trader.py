@@ -5,48 +5,92 @@ import math
 
 
 class Trader:
+    """Market making strategy for Round 1.
+
+    Pure two-sided market making, not directional. Profit comes from
+    capturing the bid-ask spread on many small trades while keeping
+    inventory near zero via skew.
+
+    Two products, one unified engine with per-product configuration:
+
+      ASH_COATED_OSMIUM
+        - Stable fair around 10000 (slow-drift EMA anchor)
+        - Strong mean reversion (ac1 ~ -0.5)
+        - Modal spread 16, occasional widening to 18-21
+        - No drift — truly stationary
+
+      INTARIAN_PEPPER_ROOT
+        - Deterministic +0.1/tick drift (empirically verified across
+          all 3 days, every 10% segment — no intraday variation)
+        - Strong mean reversion (ac1 ~ -0.5) on top of the drift
+        - Modal spread 11-13, occasional widening to 14-17
+        - Fair = EMA(microprice) projected forward by drift*horizon
+
+    Position limit: 80 per product. Target inventory = 0.
+    Skew pushes quotes against inventory to naturally unwind.
+    """
+
     POSITION_LIMIT = 80
 
     OSM = "ASH_COATED_OSMIUM"
     PEP = "INTARIAN_PEPPER_ROOT"
 
-    # Round 2 config — tuned via 2-fold CV on days -1, 0; tested on day 1.
-    # Conservative changes from Round 1 baseline (which scored 9,022 real):
-    #   - OSMIUM ema_span 15→10 for faster fair value tracking
-    #   - PEPPER drift_horizon 70→85 to capture more of the +0.1/tick drift
-    #   - PEPPER skew_coef 0.04→0.05 for slightly stronger inventory control
-    #   - Taper-in layers: small near fair (adverse selection), large at edges
+    # ── Per-product MM configuration ────────────────────────────────
+    # - fair_anchor: reference fair (None = pure EMA, no anchor)
+    # - anchor_weight: blend weight for anchor vs EMA (higher = more sticky)
+    # - drift_per_tick: known deterministic drift rate
+    # - drift_horizon: ticks ahead to forecast (fair = EMA + drift*horizon)
+    # - ema_span: smoothing for microprice EMA
+    # - take_edge: take asks <= fair - take_edge, bids >= fair + take_edge
+    # - skew_coef: inventory skew (fair shifts by skew * position)
+    # - layers: [(edge, size), ...] resting orders per side
+    # - max_book_half_spread: cap widest quote width regardless of book
+    # Research notes from real-exchange analysis (day 0 actual = 9,022):
+    #   - PEPPER captures 97% of pure drift (7.77/tick vs 8.0 theoretical).
+    #     Little room for further improvement on drift capture.
+    #   - OSMIUM was the bottleneck — only 14% of total profit at 1.27/tick.
+    #   - True OSMIUM fair ≈ 10001 (anchored mid-mode), not 10000 — the
+    #     hardcoded 10000 anchor was fighting EMA's correct discovery.
+    #
+    # Optimized choices (validated via 2-fold CV on days -2, -1, and
+    # held-out test on day 0):
+    #   1. OSMIUM: no anchor, pure EMA fair-value discovery (+ ~6,000 vs anchored)
+    #   2. OSMIUM: dense 12-layer quoting — capture many small fills
+    #      across the full bot spread
+    #   3. PEPPER: dense 10-layer quoting for same reason
+    #   4. Both: aggressive take_edge=0 (mean reversion is strong, lag1 ~ -0.5)
     CONFIG = {
         OSM: {
-            "fair_anchor":        None,
+            "fair_anchor":        None,    # pure EMA — data-driven fair
             "anchor_weight":      0.0,
             "drift_per_tick":     0.0,
             "drift_horizon":      0,
-            "ema_span":           10,
+            "ema_span":           15,
             "take_edge":          0,
             "skew_coef":          0.04,
+            # Taper-in layer sizes: minimize exposure near fair (where
+            # adverse selection hurts most) and size up at outer edges
+            # (where per-fill profit is larger). Backtester r2 analysis
+            # showed per-fill profit drives real-exchange P&L more than
+            # fill count.
             "layers":             [(i, max(4, i)) for i in range(1, 13)],
         },
         PEP: {
             "fair_anchor":        None,
             "anchor_weight":      0.0,
             "drift_per_tick":     0.10,
-            "drift_horizon":      85,
-            "ema_span":           15,
+            "drift_horizon":      70,
+            "ema_span":           8,
             "take_edge":          0,
-            "skew_coef":          0.05,
-            "layers":             [(i, max(4, i+2)) for i in range(1, 11)],
+            "skew_coef":          0.04,
+            # Same taper principle: sizes grow with edge
+            "layers":             [(i, max(5, i+3)) for i in range(1, 11)],
         },
     }
 
-    # MAF: bid for 25% more quote volume.
-    # Daily MM profit ~9,000. Extra 25% ≈ 2,250 marginal value.
-    # Bid conservatively to land in top 50% while minimizing cost.
-    MAF_BID = 1
-
-    def bid(self):
-        return self.MAF_BID
-
+    # ================================================================
+    # Entry point
+    # ================================================================
     def run(self, state: TradingState):
         saved: dict = {}
         if state.traderData:
@@ -54,8 +98,8 @@ class Trader:
                 saved = json.loads(state.traderData)
             except Exception:
                 saved = {}
-        saved.setdefault("ema", {})
-        saved.setdefault("last_fair", {})
+        saved.setdefault("ema", {})        # per-product EMA state
+        saved.setdefault("last_fair", {})  # fallback fair when book missing
 
         result: Dict[str, List[Order]] = {}
         for product in state.order_depths:
@@ -66,6 +110,9 @@ class Trader:
 
         return result, 0, json.dumps(saved)
 
+    # ================================================================
+    # Unified market-making engine
+    # ================================================================
     def _market_make(self, state: TradingState, product: str,
                      saved: dict) -> List[Order]:
         cfg = self.CONFIG[product]
@@ -75,13 +122,15 @@ class Trader:
 
         fair = self._compute_fair(od, product, cfg, saved)
         if fair is None:
-            return []
+            return []  # no book, no trades
 
+        # Apply inventory skew (push quotes away from our position)
         skewed_fair = fair - position * cfg["skew_coef"]
 
         buys: List[Order] = []
         sells: List[Order] = []
 
+        # ── TAKE: aggressive fills when book is clearly mispriced ───
         take_edge = cfg["take_edge"]
         for ask in sorted(od.sell_orders.keys()):
             if ask <= skewed_fair - take_edge:
@@ -103,6 +152,7 @@ class Trader:
             else:
                 break
 
+        # ── MAKE: layered resting quotes ────────────────────────────
         best_bid, best_ask = self._best_bbo(od)
         self._place_layers(
             buys, sells, product, skewed_fair, cfg["layers"],
@@ -111,6 +161,11 @@ class Trader:
 
         return self._clamp(buys, sells, start_pos)
 
+    # ================================================================
+    # Fair value: microprice EMA + drift forecast
+    # (Reverted from hybrid wall_mid — real exchange showed hybrid
+    # converges too close to pure mid, giving smaller per-fill spread.)
+    # ================================================================
     def _compute_fair(self, od: OrderDepth, product: str, cfg: dict,
                       saved: dict) -> Optional[float]:
         best_bid, best_ask = self._best_bbo(od)
@@ -126,14 +181,15 @@ class Trader:
         else:
             return saved["last_fair"].get(product)
 
+        ema_key = product
         span = cfg["ema_span"]
         alpha = 2.0 / (span + 1)
-        prev_ema = saved["ema"].get(product)
+        prev_ema = saved["ema"].get(ema_key)
         if prev_ema is None:
             ema = micro
         else:
             ema = alpha * micro + (1 - alpha) * prev_ema
-        saved["ema"][product] = ema
+        saved["ema"][ema_key] = ema
 
         if cfg["fair_anchor"] is not None:
             w = cfg["anchor_weight"]
@@ -145,6 +201,11 @@ class Trader:
         saved["last_fair"][product] = fair
         return fair
 
+    # ================================================================
+    # Layered quoting (symmetric sizing — reverted asymmetric).
+    # Real exchange showed asymmetric scaling cut OSMIUM fills by ~20%.
+    # Fewer quotes = fewer fills, regardless of directional bias.
+    # ================================================================
     def _place_layers(self, buys: list, sells: list, product: str,
                       fair: float, layers: list,
                       best_bid: Optional[int], best_ask: Optional[int],
@@ -174,6 +235,9 @@ class Trader:
             prev_bid_px = bid_px
             prev_ask_px = ask_px
 
+    # ================================================================
+    # Helpers
+    # ================================================================
     @staticmethod
     def _best_bbo(od: OrderDepth) -> Tuple[Optional[int], Optional[int]]:
         best_bid = max(od.buy_orders.keys()) if od.buy_orders else None
@@ -182,6 +246,10 @@ class Trader:
 
     def _clamp(self, buys: List[Order], sells: List[Order],
                current_pos: int) -> List[Order]:
+        """Ensure total buy/sell qty respects position limits even if
+        every order fills. Trim the last (widest, most speculative)
+        layers first when over-limit.
+        """
         max_buy = self.POSITION_LIMIT - current_pos
         max_sell = self.POSITION_LIMIT + current_pos
 
@@ -199,7 +267,7 @@ class Trader:
                 if new_qty != 0:
                     orders[i] = Order(orders[i].symbol, orders[i].price, new_qty)
                 else:
-                    orders[i] = None
+                    orders[i] = None  # type: ignore
                 excess -= red
             return [o for o in orders if o is not None]
 

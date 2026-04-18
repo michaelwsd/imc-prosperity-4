@@ -11,6 +11,8 @@ Usage:
     python tune.py
 """
 
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import csv
 import itertools
 import json
@@ -24,14 +26,14 @@ from backtester import (
 from trader import Trader
 
 
-DATA_DIR = "data/round1"
-TRAIN_DAYS = ["-2", "-1"]
-TEST_DAYS = ["0"]
+DATA_DIR = "data"
+TRAIN_DAYS = ["-1", "0"]
+TEST_DAYS = ["1"]
 
 
 def day_files(day: str) -> Tuple[str, str]:
-    return (f"{DATA_DIR}/prices_round_1_day_{day}.csv",
-            f"{DATA_DIR}/trades_round_1_day_{day}.csv")
+    return (f"{DATA_DIR}/prices_round_2_day_{day}.csv",
+            f"{DATA_DIR}/trades_round_2_day_{day}.csv")
 
 
 # =====================================================================
@@ -204,7 +206,7 @@ def print_top(results, label, n=5):
 # =====================================================================
 if __name__ == "__main__":
     print("\n" + "#"*70)
-    print("#" + " Round 1 Market Maker — CV Parameter Tuning ".center(68) + "#")
+    print("#" + " Round 2 Market Maker — CV Parameter Tuning ".center(68) + "#")
     print("#"*70)
     print(f" Train: {TRAIN_DAYS}   Test: {TEST_DAYS}")
 
@@ -224,15 +226,14 @@ if __name__ == "__main__":
     print(" TUNING: OSMIUM")
     print("="*70)
     osm_grid = {
-        "anchor_weight": [0.97, 0.98, 0.99],
-        "ema_span":      [20, 30, 50],
+        "ema_span":      [10, 15, 20, 30],
         "take_edge":     [0, 1],
-        "skew_coef":     [0.08, 0.10, 0.12, 0.15],
+        "skew_coef":     [0.03, 0.04, 0.05, 0.06, 0.08],
         "layers":        [
-            [(1, 15), (3, 20), (5, 30), (7, 15)],
-            [(1, 20), (3, 25), (5, 30), (7, 10)],
-            [(1, 20), (3, 25), (5, 25), (7, 15)],
-            [(2, 15), (4, 20), (6, 30), (7, 15)],
+            [(i, max(4, i)) for i in range(1, 13)],
+            [(i, 8) for i in range(1, 13)],
+            [(i, 6) for i in range(1, 13)],
+            [(i, max(3, i-1)) for i in range(1, 13)],
         ],
     }
     osm_results = grid_search_product(Trader.OSM, osm_grid, TRAIN_DAYS, locked={})
@@ -244,15 +245,15 @@ if __name__ == "__main__":
     print(" TUNING: PEPPER")
     print("="*70)
     pep_grid = {
-        "ema_span":       [5, 8, 12],
-        "drift_horizon":  [60, 70, 85, 100],
+        "ema_span":       [5, 8, 12, 15],
+        "drift_horizon":  [50, 60, 70, 85, 100],
         "take_edge":      [0, 1],
         "skew_coef":      [0.03, 0.04, 0.05, 0.06],
         "layers":         [
-            [(1, 15), (2, 20), (3, 25), (5, 20)],    # current winner
-            [(1, 20), (2, 25), (3, 25), (5, 15)],
-            [(1, 15), (2, 25), (3, 25), (5, 20)],
-            [(1, 15), (2, 15), (3, 25), (5, 25)],
+            [(i, max(5, i+3)) for i in range(1, 11)],
+            [(i, 8) for i in range(1, 11)],
+            [(i, 10) for i in range(1, 11)],
+            [(i, max(4, i+2)) for i in range(1, 11)],
         ],
     }
     pep_results = grid_search_product(

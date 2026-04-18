@@ -1,17 +1,12 @@
 """
-Local Backtester for IMC Prosperity 4
-======================================
-Reads the sample CSV data and simulates the exchange, calling your
-Trader.run() on every tick exactly like the real platform does.
-
-Simulates two types of fills:
-  1. Aggressive fills — your order crosses a bot's order (immediate)
-  2. Resting fills — your order sits in the book, and a bot trades
-     against it (simulated using the trades CSV data)
+Local Backtester for Round 2.
 
 Usage:
-    python backtester.py
+    cd round1 && python backtester.py
 """
+
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import csv
 import math
@@ -20,8 +15,7 @@ from datamodel import Listing, OrderDepth, Trade, TradingState, Order, Observati
 from trader import Trader
 
 
-def load_price_data(filepath: str) -> dict:
-    """Load the prices CSV into rows grouped by timestamp."""
+def load_price_data(filepath):
     ticks = {}
     with open(filepath) as f:
         reader = csv.DictReader(f, delimiter=';')
@@ -33,8 +27,7 @@ def load_price_data(filepath: str) -> dict:
     return ticks
 
 
-def load_trade_data(filepath: str) -> dict:
-    """Load the trades CSV into trades grouped by timestamp."""
+def load_trade_data(filepath):
     trades = {}
     with open(filepath) as f:
         reader = csv.DictReader(f, delimiter=';')
@@ -46,8 +39,7 @@ def load_trade_data(filepath: str) -> dict:
     return trades
 
 
-def build_order_depth(row: dict) -> OrderDepth:
-    """Convert a CSV row into an OrderDepth object."""
+def build_order_depth(row):
     od = OrderDepth()
     for i in range(1, 4):
         pk, vk = f'bid_price_{i}', f'bid_volume_{i}'
@@ -60,32 +52,18 @@ def build_order_depth(row: dict) -> OrderDepth:
     return od
 
 
-def match_orders(orders: list, order_depth: OrderDepth, product: str,
-                 position: int, pos_limit: int) -> tuple:
-    """
-    Simulate the exchange matching engine for aggressive orders.
-    Returns (trades, new_position, pnl_change, resting_orders).
-
-    Resting orders are orders that didn't cross the book — they'll be
-    checked against bot trade data separately.
-    """
+def match_orders(orders, order_depth, product, position, pos_limit):
     if not orders:
         return [], position, 0, []
-
-    # Position limit check
     total_buy = sum(o.quantity for o in orders if o.quantity > 0)
     total_sell = sum(-o.quantity for o in orders if o.quantity < 0)
-
     if position + total_buy > pos_limit or position - total_sell < -pos_limit:
         return [], position, 0, []
-
     trades = []
     resting = []
     pnl = 0
-
     for order in orders:
         if order.quantity > 0:
-            # BUY — match against asks
             remaining = order.quantity
             for ask_price in sorted(order_depth.sell_orders.keys()):
                 if ask_price <= order.price and remaining > 0:
@@ -102,9 +80,7 @@ def match_orders(orders: list, order_depth: OrderDepth, product: str,
                             del order_depth.sell_orders[ask_price]
             if remaining > 0:
                 resting.append(Order(product, order.price, remaining))
-
         elif order.quantity < 0:
-            # SELL — match against bids
             remaining = -order.quantity
             for bid_price in sorted(order_depth.buy_orders.keys(), reverse=True):
                 if bid_price >= order.price and remaining > 0:
@@ -121,35 +97,15 @@ def match_orders(orders: list, order_depth: OrderDepth, product: str,
                             del order_depth.buy_orders[bid_price]
             if remaining > 0:
                 resting.append(Order(product, order.price, -remaining))
-
     return trades, position, pnl, resting
 
 
-def simulate_resting_fills(resting_orders: list, bot_trades: list,
-                           product: str, position: int, pos_limit: int) -> tuple:
-    """
-    Simulate bots trading against our resting orders.
-
-    We look at the bot trades that happened this tick. If a bot trade
-    occurred at a price where our resting order would be attractive,
-    we assume some portion of that trade volume fills our order instead.
-
-    For a resting BUY at price P: if bots traded at price <= P,
-    they might sell to us instead (our price is at least as good).
-
-    For a resting SELL at price P: if bots traded at price >= P,
-    they might buy from us instead.
-
-    We fill up to 50% of the bot trade volume (conservative estimate —
-    we're competing with other bots for the same liquidity).
-    """
+def simulate_resting_fills(resting_orders, bot_trades, product, position, pos_limit):
     trades = []
     pnl = 0
-    FILL_RATE = 0.5  # assume we capture half the available volume
-
+    FILL_RATE = 0.5
     for order in resting_orders:
         if order.quantity > 0:
-            # Resting BUY — look for bot trades at or below our price
             for bt in bot_trades:
                 if bt['symbol'] == product:
                     trade_price = int(float(bt['price']))
@@ -162,11 +118,8 @@ def simulate_resting_fills(resting_orders: list, bot_trades: list,
                                                 buyer="SUBMISSION", seller="", timestamp=0))
                             position += fill
                             pnl -= order.price * fill
-                            order = Order(order.symbol, order.price,
-                                          order.quantity - fill)
-
+                            order = Order(order.symbol, order.price, order.quantity - fill)
         elif order.quantity < 0:
-            # Resting SELL — look for bot trades at or above our price
             for bt in bot_trades:
                 if bt['symbol'] == product:
                     trade_price = int(float(bt['price']))
@@ -179,18 +132,14 @@ def simulate_resting_fills(resting_orders: list, bot_trades: list,
                                                 buyer="", seller="SUBMISSION", timestamp=0))
                             position -= fill
                             pnl += order.price * fill
-                            order = Order(order.symbol, order.price,
-                                          order.quantity + fill)
-
+                            order = Order(order.symbol, order.price, order.quantity + fill)
     return trades, position, pnl
 
 
-def run_backtest(price_file: str, trade_file: str, pos_limit: int = 80):
-    """Run the full backtest on one day of data."""
+def run_backtest(price_file, trade_file, pos_limit=80):
     ticks = load_price_data(price_file)
     bot_trades = load_trade_data(trade_file)
     trader = Trader()
-
     positions = {}
     cash = 0
     cash_per_prod = {}
@@ -206,8 +155,6 @@ def run_backtest(price_file: str, trade_file: str, pos_limit: int = 80):
 
     for ts in sorted(ticks.keys()):
         rows = ticks[ts]
-
-        # Build order depths and listings
         order_depths = {}
         listings = {}
         for row in rows:
@@ -218,7 +165,6 @@ def run_backtest(price_file: str, trade_file: str, pos_limit: int = 80):
             if product not in positions:
                 positions[product] = 0
 
-        # Build market trades for this tick (from bot trade data)
         market_trades_this_tick = {}
         tick_bot_trades = bot_trades.get(ts, [])
         for bt in tick_bot_trades:
@@ -228,22 +174,14 @@ def run_backtest(price_file: str, trade_file: str, pos_limit: int = 80):
             market_trades_this_tick[sym].append(
                 Trade(sym, int(float(bt['price'])), int(bt['quantity']),
                       buyer=bt.get('buyer', ''), seller=bt.get('seller', ''),
-                      timestamp=ts)
-            )
+                      timestamp=ts))
 
-        # Build TradingState
         state = TradingState(
-            traderData=traderData,
-            timestamp=ts,
-            listings=listings,
-            order_depths=order_depths,
-            own_trades=prev_own_trades,
+            traderData=traderData, timestamp=ts, listings=listings,
+            order_depths=order_depths, own_trades=prev_own_trades,
             market_trades={**{p: [] for p in products}, **prev_market_trades},
-            position=dict(positions),
-            observations=Observation({}, {}),
-        )
+            position=dict(positions), observations=Observation({}, {}))
 
-        # Call trader
         try:
             result, conversions, traderData = trader.run(state)
         except Exception as e:
@@ -252,7 +190,6 @@ def run_backtest(price_file: str, trade_file: str, pos_limit: int = 80):
             traceback.print_exc()
             break
 
-        # Match orders
         tick_own_trades = {}
         for product in products:
             orders = result.get(product, [])
@@ -263,17 +200,10 @@ def run_backtest(price_file: str, trade_file: str, pos_limit: int = 80):
                     break
             if od is None:
                 continue
-
-            # Phase 1: aggressive fills
             trades, new_pos, pnl, resting = match_orders(
-                orders, od, product, positions[product], pos_limit
-            )
-
-            # Phase 2: simulate resting fills using bot trade data
+                orders, od, product, positions[product], pos_limit)
             resting_trades, new_pos, resting_pnl = simulate_resting_fills(
-                resting, tick_bot_trades, product, new_pos, pos_limit
-            )
-
+                resting, tick_bot_trades, product, new_pos, pos_limit)
             trades.extend(resting_trades)
             pnl += resting_pnl
             positions[product] = new_pos
@@ -285,22 +215,18 @@ def run_backtest(price_file: str, trade_file: str, pos_limit: int = 80):
         prev_own_trades = tick_own_trades
         prev_market_trades = market_trades_this_tick
 
-        # Progress reporting
         if ts % 100000 == 0 or ts == 0:
             mid_prices = {}
             for row in rows:
                 mid_prices[row['product']] = float(row['mid_price'])
             mtm = sum(positions.get(p, 0) * mid_prices.get(p, 0) for p in mid_prices)
             total_pnl = cash + mtm
-            pos_str = {k: v for k, v in positions.items()}
-            print(f"  t={ts:>7} | cash={cash:>10.0f} | pos={pos_str} | PnL={total_pnl:>10.0f}")
+            print(f"  t={ts:>7} | cash={cash:>10.0f} | pos={dict(positions)} | PnL={total_pnl:>10.0f}")
 
-    # Final summary
     last_ts = max(ticks.keys())
     mid_prices = {}
     for row in ticks[last_ts]:
         mid_prices[row['product']] = float(row['mid_price'])
-
     unrealized = sum(positions.get(p, 0) * mid_prices.get(p, 0) for p in mid_prices)
     total_pnl = cash + unrealized
 
@@ -321,22 +247,15 @@ def run_backtest(price_file: str, trade_file: str, pos_limit: int = 80):
 
 
 if __name__ == "__main__":
-    print("""
-╔══════════════════════════════════════════════════════════════════════╗
-║              IMC PROSPERITY 4 — LOCAL BACKTESTER                   ║
-╚══════════════════════════════════════════════════════════════════════╝
-    """)
-
     results = {}
-    for day in ["-2", "-1", "0"]:
+    for day in ["-1", "0", "1"]:
         results[day] = run_backtest(
-            f"data/round1/prices_round_1_day_{day}.csv",
-            f"data/round1/trades_round_1_day_{day}.csv",
+            f"data/prices_round_2_day_{day}.csv",
+            f"data/trades_round_2_day_{day}.csv",
         )
-
     total = sum(results.values())
     print(f"\n{'='*70}")
-    print(f"  COMBINED ROUND 1 RESULTS")
+    print(f"  COMBINED ROUND 2 RESULTS")
     print(f"{'='*70}")
     for day, pnl in results.items():
         print(f"  Day {day:>3} PnL: {pnl:>12,.0f} XIRECS")
